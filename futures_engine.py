@@ -8,15 +8,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CSV_FILE = "futures_log.csv"
 
-# ── RISK BOUNDARIES & ACCOUNT CONFIG ──
-ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
-LEVERAGE = 3                   # 3x Isolated margin
-MARGIN_PER_TRADE = 5.0         # Risk $5 margin per trade
-RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
-MAX_ACTIVE_PAIRS = 20          # Auto-select Top 20 liquid futures pairs
+# ── TARGET ASSETS & RISK BOUNDARIES ──
+PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "DOGEUSDT", "XRPUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT"]
+ACCOUNT_BALANCE_USD = 15.0
+LEVERAGE = 3
+MARGIN_PER_TRADE = 5.0
+RR_RATIO_TARGET = 2.5
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"Telegram secret missing: Token={'SET' if TELEGRAM_BOT_TOKEN else 'MISSING'}, Chat={'SET' if TELEGRAM_CHAT_ID else 'MISSING'}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -32,36 +33,22 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"Telegram dispatch error: {e}")
 
-def get_top_volume_pairs(limit: int = 20) -> list:
-    """Dynamically fetches the top USDT perpetuals by 24h volume."""
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            tickers = res.json()
-            # Filter USDT perpetual contracts, excluding stable pairs
-            usdt_tickers = [
-                t for t in tickers 
-                if t.get("symbol", "").endswith("USDT") and not any(s in t.get("symbol", "") for s in ["USDC", "FDUSD", "TUSD"])
-            ]
-            # Sort by 24h quote volume descending
-            usdt_tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-            top_symbols = [t["symbol"] for t in usdt_tickers[:limit]]
-            return top_symbols
-    except Exception as e:
-        print(f"Failed to fetch volume universe: {e}")
-    # Fallback to high-liquidity staples if API query fails
-    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT", "BNBUSDT", "NEARUSDT", "SUIUSDT", "AVAXUSDT", "LINKUSDT"]
-
-def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+def get_klines_bybit(symbol: str, interval: str, limit: int = 60) -> list:
+    """Public Bybit Futures endpoint - bypasses US cloud geo-blocks."""
+    interval_map = {"15m": "15", "1h": "60"}
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval_map.get(interval, "15"),
+        "limit": limit
+    }
     try:
         res = requests.get(url, params=params, timeout=10)
         if res.status_code == 200:
-            raw = res.json()
+            data = res.json().get("result", {}).get("list", [])
             candles = []
-            for c in raw:
+            for c in reversed(data):
                 candles.append({
                     "open_time": int(c[0]),
                     "open": float(c[1]),
@@ -72,16 +59,18 @@ def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
                 })
             return candles
     except Exception as e:
-        print(f"Kline fetch error on {symbol} ({interval}): {e}")
+        print(f"Bybit Kline fetch error on {symbol} ({interval}): {e}")
     return []
 
-def get_current_mark_price(symbol: str) -> float:
-    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-    params = {"symbol": symbol}
+def get_mark_price_bybit(symbol: str) -> float:
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear", "symbol": symbol}
     try:
         res = requests.get(url, params=params, timeout=8)
         if res.status_code == 200:
-            return float(res.json().get("markPrice", 0) or 0)
+            tickers = res.json().get("result", {}).get("list", [])
+            if tickers:
+                return float(tickers[0].get("markPrice", 0) or 0)
     except Exception as e:
         print(f"Mark price fetch error for {symbol}: {e}")
     return 0.0
@@ -129,7 +118,7 @@ def update_active_paper_trades():
         if entry <= 0:
             continue
 
-        mark_price = get_current_mark_price(symbol)
+        mark_price = get_mark_price_bybit(symbol)
         if mark_price <= 0:
             continue
 
@@ -229,9 +218,10 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
         ])
 
 def analyze_market(symbol: str):
-    k_15m = get_klines(symbol, "15m", limit=50)
-    k_1h = get_klines(symbol, "1h", limit=60)
+    k_15m = get_klines_bybit(symbol, "15m", limit=50)
+    k_1h = get_klines_bybit(symbol, "1h", limit=60)
     if len(k_15m) < 10 or len(k_1h) < 50:
+        print(f"[{symbol}] Insufficient candle data.")
         return
 
     closes_1h = [c["close"] for c in k_1h]
@@ -245,6 +235,8 @@ def analyze_market(symbol: str):
 
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
+
+    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H Bias: {trend_bias} | FVG: {'BULL' if bullish_fvg else 'BEAR' if bearish_fvg else 'NONE'}")
 
     if trend_bias == "BULLISH" and bullish_fvg:
         entry_price = c3["low"]
@@ -307,9 +299,8 @@ if __name__ == "__main__":
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
-    active_pairs = get_top_volume_pairs(limit=MAX_ACTIVE_PAIRS)
-    print(f"Scanning Top {len(active_pairs)} volume perpetuals...")
-    for pair in active_pairs:
+    print("Scanning target perpetuals...")
+    for pair in PAIRS:
         analyze_market(pair)
-        time.sleep(0.1)  # 100ms throttle to prevent rate-limiting
+        time.sleep(0.1)
     print("Execution complete.")
