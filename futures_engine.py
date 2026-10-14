@@ -13,7 +13,7 @@ PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "DOGEUSDT", "XRPUSDT", "SUIUSDT", "NEA
 ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
 LEVERAGE = 3                   # 3x Isolated margin
 MARGIN_PER_TRADE = 5.0         # Risk $5 margin per trade
-RR_RATIO_TARGET = 3.0          # Upgraded 1:3.0 Risk-to-Reward for higher ROI
+RR_RATIO_TARGET = 3.0          # 1:3.0 Target for higher realized ROI
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -97,14 +97,96 @@ def calculate_atr(candles: list, period: int = 14) -> float:
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
 
+def calculate_adx(candles: list, period: int = 14) -> float:
+    """
+    Wilder's Average Directional Index (ADX):
+    ADX < 20: Weak chop / Sideways consolidation.
+    ADX >= 22: Strong directional momentum.
+    """
+    if len(candles) < (period * 2) + 1:
+        return 25.0
+
+    tr_list, dm_plus_list, dm_minus_list = [], [], []
+
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        prev_h = candles[i - 1]["high"]
+        prev_l = candles[i - 1]["low"]
+        prev_c = candles[i - 1]["close"]
+
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        tr_list.append(tr)
+
+        up_move = h - prev_h
+        down_move = prev_l - l
+
+        if up_move > down_move and up_move > 0:
+            dm_plus_list.append(up_move)
+        else:
+            dm_plus_list.append(0.0)
+
+        if down_move > up_move and down_move > 0:
+            dm_minus_list.append(down_move)
+        else:
+            dm_minus_list.append(0.0)
+
+    tr_smooth = sum(tr_list[:period])
+    dm_plus_smooth = sum(dm_plus_list[:period])
+    dm_minus_smooth = sum(dm_minus_list[:period])
+
+    dx_list = []
+    for i in range(period, len(tr_list)):
+        tr_smooth = tr_smooth - (tr_smooth / period) + tr_list[i]
+        dm_plus_smooth = dm_plus_smooth - (dm_plus_smooth / period) + dm_plus_list[i]
+        dm_minus_smooth = dm_minus_smooth - (dm_minus_smooth / period) + dm_minus_list[i]
+
+        di_plus = (dm_plus_smooth / tr_smooth) * 100 if tr_smooth > 0 else 0
+        di_minus = (dm_minus_smooth / tr_smooth) * 100 if tr_smooth > 0 else 0
+
+        denom = di_plus + di_minus
+        dx = (abs(di_plus - di_minus) / denom) * 100 if denom > 0 else 0
+        dx_list.append(dx)
+
+    if len(dx_list) < period:
+        return 25.0
+
+    return sum(dx_list[-period:]) / period
+
 def is_displacement_confirmed(candles: list, c_index: int) -> bool:
-    """Validates that the impulse candle carries >= 1.3x 15-period average volume."""
+    """Validates that impulse candle has >= 1.3x 15-period average volume."""
     vol_recent = [c["volume"] for c in candles[-16:-1]]
     if not vol_recent:
         return True
     avg_vol = sum(vol_recent) / len(vol_recent)
     candle_vol = candles[c_index]["volume"]
     return candle_vol >= (avg_vol * 1.3)
+
+def evaluate_market_regime(k_1h: list, k_15m: list) -> tuple[str, float, str]:
+    """Filters out sideways chop using 1H EMA Ribbon separation and 15M ADX."""
+    closes_1h = [c["close"] for c in k_1h]
+    ema_20_1h = calculate_ema(closes_1h, 20)
+    ema_50_1h = calculate_ema(closes_1h, 50)
+    current_price = k_15m[-1]["close"]
+
+    adx_val = calculate_adx(k_15m, period=14)
+
+    # 1. Chop Filter: ADX < 20
+    if adx_val < 20.0:
+        return "SIDEWAYS", adx_val, f"ADX {adx_val:.1f} < 20 (Ranging/Chop)"
+
+    # 2. EMA Compression Check
+    ema_spread_pct = abs(ema_20_1h - ema_50_1h) / ema_50_1h * 100
+    if ema_spread_pct < 0.20:
+        return "SIDEWAYS", adx_val, f"EMA Ribbon Tangled ({ema_spread_pct:.2f}% < 0.20%)"
+
+    # 3. Clean Directional Alignment
+    if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
+        return "BULLISH", adx_val, f"Uptrend (1H EMA 20 > 50, ADX {adx_val:.1f})"
+    elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
+        return "BEARISH", adx_val, f"Downtrend (1H EMA 20 < 50, ADX {adx_val:.1f})"
+
+    return "SIDEWAYS", adx_val, "Mixed EMA Alignment (Price between EMA 20 & 50)"
 
 def initialize_journal():
     if not os.path.exists(CSV_FILE):
@@ -117,7 +199,7 @@ def initialize_journal():
             ])
 
 def update_active_paper_trades():
-    """Audits open trades with dual mathematical sanity checks."""
+    """Audits open positions with dual mathematical validation."""
     if not os.path.exists(CSV_FILE):
         return
 
@@ -181,13 +263,13 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-        # ── SHORT AUDIT (CORRECTED OPERATORS) ──
+        # ── SHORT AUDIT (FIXED INVERTED OPERATORS) ──
         elif direction == "SHORT":
             raw_pnl_pct = ((entry - mark_price) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            # TP: Price drops down to target AND return is positive
+            # TP: Price drops to target AND return is positive
             if mark_price <= tp and leveraged_pnl_pct > 0:
                 row["status"] = "TP HIT"
                 updated = True
@@ -201,7 +283,7 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-            # SL: Price rises up to stop-loss AND return is negative
+            # SL: Price rises to stop-loss AND return is negative
             elif mark_price >= sl and leveraged_pnl_pct < 0:
                 row["status"] = "SL HIT"
                 updated = True
@@ -256,21 +338,18 @@ def check_institutional_fvg(candles: list) -> tuple[bool, bool, float, str]:
         c2 = candles[offset]
         c3 = candles[offset + 1]
 
-        # 1. Displacement Volume Filter
         if not is_displacement_confirmed(candles, offset):
             continue
 
-        # 2. Bullish FVG Setup
+        # Bullish: Low of C3 > High of C1
         if c3["low"] > c1["high"] and c2["close"] > c2["open"]:
-            # Verify Liquidity Sweep: Did C1 or C2 sweep prior swing low?
             prior_lows = [c["low"] for c in candles[offset - 8:offset - 1]]
             sweep_confirmed = prior_lows and min(c1["low"], c2["low"]) <= min(prior_lows)
             note = "Displacement + Liquidity Sweep Confirmed" if sweep_confirmed else "Displacement Volume Confirmed"
             return True, False, c3["low"], note
 
-        # 3. Bearish FVG Setup
+        # Bearish: High of C3 < Low of C1
         if c3["high"] < c1["low"] and c2["close"] < c2["open"]:
-            # Verify Liquidity Sweep: Did C1 or C2 sweep prior swing high?
             prior_highs = [c["high"] for c in candles[offset - 8:offset - 1]]
             sweep_confirmed = prior_highs and max(c1["high"], c2["high"]) >= max(prior_highs)
             note = "Displacement + Liquidity Sweep Confirmed" if sweep_confirmed else "Displacement Volume Confirmed"
@@ -279,30 +358,33 @@ def check_institutional_fvg(candles: list) -> tuple[bool, bool, float, str]:
     return False, False, 0.0, "NONE"
 
 def analyze_market(symbol: str):
-    k_15m = get_klines_mexc(symbol, "15m", limit=50)
+    k_15m = get_klines_mexc(symbol, "15m", limit=60)
     k_1h = get_klines_mexc(symbol, "1h", limit=60)
-    if len(k_15m) < 15 or len(k_1h) < 50:
+    if len(k_15m) < 35 or len(k_1h) < 50:
         print(f"[{symbol}] Insufficient candle history.")
         return
 
-    closes_1h = [c["close"] for c in k_1h]
-    ema_50_1h = calculate_ema(closes_1h, 50)
+    # 1. Market Regime & Chop Audit
+    regime, adx_val, regime_reason = evaluate_market_regime(k_1h, k_15m)
     current_price = k_15m[-1]["close"]
-    trend_bias = "BULLISH" if current_price > ema_50_1h else "BEARISH"
 
+    if regime == "SIDEWAYS":
+        print(f"[{symbol}] ⏸️ SKIP: {regime_reason}")
+        return
+
+    # 2. Institutional Imbalance Verification
     bullish_fvg, bearish_fvg, fvg_entry, edge_note = check_institutional_fvg(k_15m)
 
-    # Calculate dynamic volatility buffer using ATR
     atr_15m = calculate_atr(k_15m, period=14)
-    atr_buffer = atr_15m * 0.40  # 40% ATR buffer stops premature wick-outs
+    atr_buffer = atr_15m * 0.40  # 40% ATR buffer stops premature wick stop-outs
 
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
 
     status_fvg = "BULL" if bullish_fvg else "BEAR" if bearish_fvg else "NONE"
-    print(f"[{symbol}] Price: ${current_price:,.4f} | 1H EMA: ${ema_50_1h:,.4f} ({trend_bias}) | FVG: {status_fvg} | ATR: ${atr_15m:.4f}")
+    print(f"[{symbol}] Price: ${current_price:,.4f} | Regime: {regime} (ADX: {adx_val:.1f}) | FVG: {status_fvg} | ATR: ${atr_15m:.4f}")
 
-    if trend_bias == "BULLISH" and bullish_fvg:
+    if regime == "BULLISH" and bullish_fvg:
         entry_price = fvg_entry if fvg_entry > 0 else current_price
         stop_loss = swing_low - atr_buffer
         risk_per_unit = entry_price - stop_loss
@@ -317,20 +399,21 @@ def analyze_market(symbol: str):
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
 
                 msg = (
-                    f"📊 <b>NEW HIGH-CONFLUENCE TRADE: {symbol}</b>\n\n"
+                    f"📊 <b>HIGH-CONFLUENCE TREND TRADE: {symbol}</b>\n\n"
                     f"<b>Direction:</b> 🟢 <b>LONG</b>\n"
+                    f"• <b>Regime:</b> Confirmed Trend (ADX {adx_val:.1f})\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
                     f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
                     f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f} (Buffered ATR)\n"
                     f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R Target)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA Bias"
+                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA 20/50 Ribbon"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "LONG", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
 
-    elif trend_bias == "BEARISH" and bearish_fvg:
+    elif regime == "BEARISH" and bearish_fvg:
         entry_price = fvg_entry if fvg_entry > 0 else current_price
         stop_loss = swing_high + atr_buffer
         risk_per_unit = stop_loss - entry_price
@@ -345,15 +428,16 @@ def analyze_market(symbol: str):
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
 
                 msg = (
-                    f"📊 <b>NEW HIGH-CONFLUENCE TRADE: {symbol}</b>\n\n"
+                    f"📊 <b>HIGH-CONFLUENCE TREND TRADE: {symbol}</b>\n\n"
                     f"<b>Direction:</b> 🔴 <b>SHORT</b>\n"
+                    f"• <b>Regime:</b> Confirmed Trend (ADX {adx_val:.1f})\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
                     f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
                     f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f} (Buffered ATR)\n"
                     f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R Target)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA Bias"
+                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA 20/50 Ribbon"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "SHORT", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
@@ -363,7 +447,7 @@ if __name__ == "__main__":
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
-    print("Scanning target perpetuals with Institutional Edge Engine...")
+    print("Scanning target perpetuals with Trend & Anti-Chop Engine...")
     for pair in PAIRS:
         analyze_market(pair)
         time.sleep(0.1)
