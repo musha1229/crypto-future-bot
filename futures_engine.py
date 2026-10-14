@@ -97,6 +97,10 @@ def initialize_journal():
             ])
 
 def update_active_paper_trades():
+    """
+    Audits active paper trades.
+    Strictly verifies TP and SL boundaries against price and direction.
+    """
     if not os.path.exists(CSV_FILE):
         return
 
@@ -126,12 +130,14 @@ def update_active_paper_trades():
 
         row["current_price"] = f"{mark_price:.4f}"
 
+        # ── LONG AUDIT ──
         if direction == "LONG":
             raw_pnl_pct = ((mark_price - entry) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            if mark_price >= tp:
+            # TP: Price reaches or exceeds TP AND PnL is strictly positive
+            if mark_price >= tp and leveraged_pnl_pct > 0:
                 row["status"] = "TP HIT"
                 updated = True
                 msg = (
@@ -140,11 +146,12 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Target:</b> ${tp:,.4f}\n\n"
-                    f"💰 <b>Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
+                    f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
 
-            elif mark_price <= sl:
+            # SL: Price drops to or below SL AND PnL is strictly negative
+            elif mark_price <= sl and leveraged_pnl_pct < 0:
                 row["status"] = "SL HIT"
                 updated = True
                 msg = (
@@ -153,16 +160,18 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
-                    f"⚠️ <b>Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
+                    f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
 
+        # ── SHORT AUDIT (FIXED OPERATORS) ──
         elif direction == "SHORT":
             raw_pnl_pct = ((entry - mark_price) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            if mark_price >= tp:
+            # TP: Price drops down to or below TP AND PnL is strictly positive
+            if mark_price <= tp and leveraged_pnl_pct > 0:
                 row["status"] = "TP HIT"
                 updated = True
                 msg = (
@@ -171,11 +180,12 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Target:</b> ${tp:,.4f}\n\n"
-                    f"💰 <b>Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
+                    f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
 
-            elif mark_price <= sl:
+            # SL: Price rises up to or above SL AND PnL is strictly negative
+            elif mark_price >= sl and leveraged_pnl_pct < 0:
                 row["status"] = "SL HIT"
                 updated = True
                 msg = (
@@ -184,7 +194,7 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
-                    f"⚠️ <b>Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
+                    f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
 
@@ -204,7 +214,7 @@ def is_recent_setup_logged(symbol: str, direction: str) -> bool:
         return False
     with open(CSV_FILE, mode="r", newline="", encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
-        for row in reader[-10:]:
+        for row in reader[-15:]:
             if row.get("symbol") == symbol and row.get("direction") == direction and row.get("status") == "ACTIVE":
                 return True
     return False
@@ -221,20 +231,19 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
 
 def check_fvg_window(candles: list) -> tuple[bool, bool, float]:
     """
-    Checks the last 3 completed candle formations for any valid Fair Value Gap.
-    Returns (bullish_fvg_found, bearish_fvg_found, entry_level).
+    Audits the last 3 closed candle sets for a 15-minute Fair Value Gap.
+    Returns (bullish_fvg, bearish_fvg, entry_target).
     """
-    # Evaluate across index -4, -3, -2
     for offset in [-4, -3]:
         c1 = candles[offset - 1]
         c2 = candles[offset]
         c3 = candles[offset + 1]
 
-        # Bullish FVG: Gap between Candle 1 High and Candle 3 Low
+        # Bullish FVG: Low of candle 3 is above High of candle 1
         if c3["low"] > c1["high"] and c2["close"] > c2["open"]:
             return True, False, c3["low"]
 
-        # Bearish FVG: Gap between Candle 1 Low and Candle 3 High
+        # Bearish FVG: High of candle 3 is below Low of candle 1
         if c3["high"] < c1["low"] and c2["close"] < c2["open"]:
             return False, True, c3["high"]
 
@@ -258,7 +267,7 @@ def analyze_market(symbol: str):
     swing_high = max(c["high"] for c in k_15m[-10:])
 
     status_fvg = "BULL" if bullish_fvg else "BEAR" if bearish_fvg else "NONE"
-    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H EMA: ${ema_50_1h:,.2f} ({trend_bias}) | FVG: {status_fvg}")
+    print(f"[{symbol}] Price: ${current_price:,.4f} | 1H EMA: ${ema_50_1h:,.4f} ({trend_bias}) | FVG: {status_fvg}")
 
     if trend_bias == "BULLISH" and bullish_fvg:
         entry_price = fvg_entry if fvg_entry > 0 else current_price
@@ -318,9 +327,6 @@ def analyze_market(symbol: str):
 
 if __name__ == "__main__":
     initialize_journal()
-    print("Sending bot connection verification ping...")
-    send_telegram("⚡ <b>Futures Engine Connected:</b> Scanner active and scanning 15M/1H market confluence.")
-    
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
