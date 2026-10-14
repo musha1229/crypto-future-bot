@@ -12,7 +12,7 @@ CSV_FILE = "futures_log.csv"
 PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "DOGEUSDT", "XRPUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT"]
 ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
 LEVERAGE = 3                   # 3x Isolated margin
-MARGIN_PER_TRADE = 5.0         # Risk only $5 margin per trade
+MARGIN_PER_TRADE = 5.0         # Risk $5 margin per trade
 RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
 
 HEADERS = {
@@ -21,6 +21,7 @@ HEADERS = {
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram secret missing: Make sure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in GitHub Secrets.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -31,13 +32,14 @@ def send_telegram(text: str):
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
+        if res.status_code == 200:
+            print("Telegram alert delivered successfully.")
+        else:
             print(f"Telegram API Error ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"Telegram dispatch error: {e}")
 
 def get_klines_mexc(symbol: str, interval: str, limit: int = 60) -> list:
-    """Public MEXC endpoint - open access from cloud runner IPs."""
     interval_map = {"15m": "15m", "1h": "60m"}
     url = "https://api.mexc.com/api/v3/klines"
     params = {
@@ -60,10 +62,8 @@ def get_klines_mexc(symbol: str, interval: str, limit: int = 60) -> list:
                     "volume": float(c[5])
                 })
             return candles
-        else:
-            print(f"MEXC error {symbol}: HTTP {res.status_code}")
     except Exception as e:
-        print(f"MEXC Kline fetch exception on {symbol} ({interval}): {e}")
+        print(f"MEXC Kline fetch error on {symbol} ({interval}): {e}")
     return []
 
 def get_mark_price_mexc(symbol: str) -> float:
@@ -140,7 +140,7 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Target:</b> ${tp:,.4f}\n\n"
-                    f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
+                    f"💰 <b>Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
 
@@ -153,7 +153,7 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
-                    f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
+                    f"⚠️ <b>Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
 
@@ -162,7 +162,7 @@ def update_active_paper_trades():
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            if mark_price <= tp:
+            if mark_price >= tp:
                 row["status"] = "TP HIT"
                 updated = True
                 msg = (
@@ -171,7 +171,7 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Target:</b> ${tp:,.4f}\n\n"
-                    f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
+                    f"💰 <b>Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
 
@@ -184,7 +184,7 @@ def update_active_paper_trades():
                     f"• <b>Entry:</b> ${entry:,.4f}\n"
                     f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
                     f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
-                    f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
+                    f"⚠️ <b>Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
 
@@ -219,11 +219,32 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
             f"{entry:.4f}", "0.00%", "ACTIVE"
         ])
 
+def check_fvg_window(candles: list) -> tuple[bool, bool, float]:
+    """
+    Checks the last 3 completed candle formations for any valid Fair Value Gap.
+    Returns (bullish_fvg_found, bearish_fvg_found, entry_level).
+    """
+    # Evaluate across index -4, -3, -2
+    for offset in [-4, -3]:
+        c1 = candles[offset - 1]
+        c2 = candles[offset]
+        c3 = candles[offset + 1]
+
+        # Bullish FVG: Gap between Candle 1 High and Candle 3 Low
+        if c3["low"] > c1["high"] and c2["close"] > c2["open"]:
+            return True, False, c3["low"]
+
+        # Bearish FVG: Gap between Candle 1 Low and Candle 3 High
+        if c3["high"] < c1["low"] and c2["close"] < c2["open"]:
+            return False, True, c3["high"]
+
+    return False, False, 0.0
+
 def analyze_market(symbol: str):
     k_15m = get_klines_mexc(symbol, "15m", limit=50)
     k_1h = get_klines_mexc(symbol, "1h", limit=60)
     if len(k_15m) < 10 or len(k_1h) < 50:
-        print(f"[{symbol}] Insufficient candle data (15m: {len(k_15m)}, 1h: {len(k_1h)})")
+        print(f"[{symbol}] Insufficient candle data.")
         return
 
     closes_1h = [c["close"] for c in k_1h]
@@ -231,17 +252,16 @@ def analyze_market(symbol: str):
     current_price = k_15m[-1]["close"]
     trend_bias = "BULLISH" if current_price > ema_50_1h else "BEARISH"
 
-    c1, c2, c3 = k_15m[-4], k_15m[-3], k_15m[-2]
-    bullish_fvg = c3["low"] > c1["high"] and c2["close"] > c2["open"]
-    bearish_fvg = c3["high"] < c1["low"] and c2["close"] < c2["open"]
+    bullish_fvg, bearish_fvg, fvg_entry = check_fvg_window(k_15m)
 
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
 
-    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H EMA: ${ema_50_1h:,.2f} ({trend_bias}) | FVG: {'BULL' if bullish_fvg else 'BEAR' if bearish_fvg else 'NONE'}")
+    status_fvg = "BULL" if bullish_fvg else "BEAR" if bearish_fvg else "NONE"
+    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H EMA: ${ema_50_1h:,.2f} ({trend_bias}) | FVG: {status_fvg}")
 
     if trend_bias == "BULLISH" and bullish_fvg:
-        entry_price = c3["low"]
+        entry_price = fvg_entry if fvg_entry > 0 else current_price
         stop_loss = swing_low
         risk_per_unit = entry_price - stop_loss
 
@@ -249,7 +269,7 @@ def analyze_market(symbol: str):
             target_price = entry_price + (risk_per_unit * RR_RATIO_TARGET)
             risk_pct = (risk_per_unit / entry_price) * 100
 
-            if 0.5 <= risk_pct <= 2.5 and not is_recent_setup_logged(symbol, "LONG"):
+            if 0.4 <= risk_pct <= 3.5 and not is_recent_setup_logged(symbol, "LONG"):
                 notional_position = MARGIN_PER_TRADE * LEVERAGE
                 dollar_risk = (risk_pct / 100) * notional_position
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
@@ -269,7 +289,7 @@ def analyze_market(symbol: str):
                 log_signal(symbol, "LONG", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
 
     elif trend_bias == "BEARISH" and bearish_fvg:
-        entry_price = c3["high"]
+        entry_price = fvg_entry if fvg_entry > 0 else current_price
         stop_loss = swing_high
         risk_per_unit = stop_loss - entry_price
 
@@ -277,7 +297,7 @@ def analyze_market(symbol: str):
             target_price = entry_price - (risk_per_unit * RR_RATIO_TARGET)
             risk_pct = (risk_per_unit / entry_price) * 100
 
-            if 0.5 <= risk_pct <= 2.5 and not is_recent_setup_logged(symbol, "SHORT"):
+            if 0.4 <= risk_pct <= 3.5 and not is_recent_setup_logged(symbol, "SHORT"):
                 notional_position = MARGIN_PER_TRADE * LEVERAGE
                 dollar_risk = (risk_pct / 100) * notional_position
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
@@ -298,7 +318,9 @@ def analyze_market(symbol: str):
 
 if __name__ == "__main__":
     initialize_journal()
-    send_telegram("🔔 <b>Telegram Connection Check:</b> Bot is online and monitoring live pairs!")
+    print("Sending bot connection verification ping...")
+    send_telegram("⚡ <b>Futures Engine Connected:</b> Scanner active and scanning 15M/1H market confluence.")
+    
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
