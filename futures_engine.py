@@ -298,6 +298,7 @@ def analyze_market(symbol: str):
 
 if __name__ == "__main__":
     initialize_journal()
+    send_telegram("🔔 <b>Telegram Connection Check:</b> Bot is online and monitoring live pairs!")
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
