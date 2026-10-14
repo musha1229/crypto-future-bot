@@ -16,18 +16,21 @@ RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"TELEGRAM CONFIG MISSING: TOKEN={'SET' if TELEGRAM_BOT_TOKEN else 'MISSING'}, CHAT_ID={'SET' if TELEGRAM_CHAT_ID else 'MISSING'}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID.strip(),
+        "chat_id": str(TELEGRAM_CHAT_ID).strip(),
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Telegram API Error ({res.status_code}): {res.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram dispatch error: {e}")
 
 def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
     """Fetches public candlestick data from Binance Futures REST API."""
@@ -114,13 +117,12 @@ def update_active_paper_trades():
 
         row["current_price"] = f"{mark_price:.2f}"
 
-        # Calculate PnL based on position direction and leverage
+        # ── LONG POSITION AUDIT ──
         if direction == "LONG":
             raw_pnl_pct = ((mark_price - entry) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            # Check Take Profit
             if mark_price >= tp:
                 row["status"] = "TP HIT"
                 updated = True
@@ -134,7 +136,6 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-            # Check Stop Loss
             elif mark_price <= sl:
                 row["status"] = "SL HIT"
                 updated = True
@@ -148,13 +149,13 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
+        # ── SHORT POSITION AUDIT ──
         elif direction == "SHORT":
             raw_pnl_pct = ((entry - mark_price) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            # Check Take Profit
-            if mark_price >= tp:
+            if mark_price <= tp:
                 row["status"] = "TP HIT"
                 updated = True
                 msg = (
@@ -167,7 +168,6 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-            # Check Stop Loss
             elif mark_price >= sl:
                 row["status"] = "SL HIT"
                 updated = True
@@ -292,7 +292,6 @@ def analyze_market(symbol: str):
 
 if __name__ == "__main__":
     initialize_journal()
-    send_telegram("🚀 <b>Futures Confluence Engine connected successfully!</b>\nMonitoring SOL and ETH 15m/1h setups...")
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
