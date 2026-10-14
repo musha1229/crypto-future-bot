@@ -10,14 +10,17 @@ CSV_FILE = "futures_log.csv"
 
 # ── TARGET ASSETS & RISK BOUNDARIES ──
 PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "DOGEUSDT", "XRPUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT"]
-ACCOUNT_BALANCE_USD = 15.0
-LEVERAGE = 3
-MARGIN_PER_TRADE = 5.0
-RR_RATIO_TARGET = 2.5
+ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
+LEVERAGE = 3                   # 3x Isolated margin
+MARGIN_PER_TRADE = 5.0         # Risk only $5 margin per trade
+RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram secret missing: Token={'SET' if TELEGRAM_BOT_TOKEN else 'MISSING'}, Chat={'SET' if TELEGRAM_CHAT_ID else 'MISSING'}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -33,22 +36,21 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"Telegram dispatch error: {e}")
 
-def get_klines_bybit(symbol: str, interval: str, limit: int = 60) -> list:
-    """Public Bybit Futures endpoint - bypasses US cloud geo-blocks."""
-    interval_map = {"15m": "15", "1h": "60"}
-    url = "https://api.bybit.com/v5/market/kline"
+def get_klines_mexc(symbol: str, interval: str, limit: int = 60) -> list:
+    """Public MEXC endpoint - open access from cloud runner IPs."""
+    interval_map = {"15m": "15m", "1h": "60m"}
+    url = "https://api.mexc.com/api/v3/klines"
     params = {
-        "category": "linear",
         "symbol": symbol,
-        "interval": interval_map.get(interval, "15"),
+        "interval": interval_map.get(interval, "15m"),
         "limit": limit
     }
     try:
-        res = requests.get(url, params=params, timeout=10)
+        res = requests.get(url, params=params, headers=HEADERS, timeout=10)
         if res.status_code == 200:
-            data = res.json().get("result", {}).get("list", [])
+            data = res.json()
             candles = []
-            for c in reversed(data):
+            for c in data:
                 candles.append({
                     "open_time": int(c[0]),
                     "open": float(c[1]),
@@ -58,21 +60,21 @@ def get_klines_bybit(symbol: str, interval: str, limit: int = 60) -> list:
                     "volume": float(c[5])
                 })
             return candles
+        else:
+            print(f"MEXC error {symbol}: HTTP {res.status_code}")
     except Exception as e:
-        print(f"Bybit Kline fetch error on {symbol} ({interval}): {e}")
+        print(f"MEXC Kline fetch exception on {symbol} ({interval}): {e}")
     return []
 
-def get_mark_price_bybit(symbol: str) -> float:
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear", "symbol": symbol}
+def get_mark_price_mexc(symbol: str) -> float:
+    url = "https://api.mexc.com/api/v3/ticker/price"
+    params = {"symbol": symbol}
     try:
-        res = requests.get(url, params=params, timeout=8)
+        res = requests.get(url, params=params, headers=HEADERS, timeout=8)
         if res.status_code == 200:
-            tickers = res.json().get("result", {}).get("list", [])
-            if tickers:
-                return float(tickers[0].get("markPrice", 0) or 0)
+            return float(res.json().get("price", 0) or 0)
     except Exception as e:
-        print(f"Mark price fetch error for {symbol}: {e}")
+        print(f"Price fetch error for {symbol}: {e}")
     return 0.0
 
 def calculate_ema(prices: list, period: int) -> float:
@@ -118,7 +120,7 @@ def update_active_paper_trades():
         if entry <= 0:
             continue
 
-        mark_price = get_mark_price_bybit(symbol)
+        mark_price = get_mark_price_mexc(symbol)
         if mark_price <= 0:
             continue
 
@@ -218,10 +220,10 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
         ])
 
 def analyze_market(symbol: str):
-    k_15m = get_klines_bybit(symbol, "15m", limit=50)
-    k_1h = get_klines_bybit(symbol, "1h", limit=60)
+    k_15m = get_klines_mexc(symbol, "15m", limit=50)
+    k_1h = get_klines_mexc(symbol, "1h", limit=60)
     if len(k_15m) < 10 or len(k_1h) < 50:
-        print(f"[{symbol}] Insufficient candle data.")
+        print(f"[{symbol}] Insufficient candle data (15m: {len(k_15m)}, 1h: {len(k_1h)})")
         return
 
     closes_1h = [c["close"] for c in k_1h]
@@ -236,7 +238,7 @@ def analyze_market(symbol: str):
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
 
-    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H Bias: {trend_bias} | FVG: {'BULL' if bullish_fvg else 'BEAR' if bearish_fvg else 'NONE'}")
+    print(f"[{symbol}] Price: ${current_price:,.2f} | 1H EMA: ${ema_50_1h:,.2f} ({trend_bias}) | FVG: {'BULL' if bullish_fvg else 'BEAR' if bearish_fvg else 'NONE'}")
 
     if trend_bias == "BULLISH" and bullish_fvg:
         entry_price = c3["low"]
