@@ -2,21 +2,21 @@ import csv
 from datetime import datetime, timezone
 import os
 import requests
+import time
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CSV_FILE = "futures_log.csv"
 
-# ── TARGET ASSETS & RISK BOUNDARIES ──
-PAIRS = ["SOLUSDT", "ETHUSDT"]
+# ── RISK BOUNDARIES & ACCOUNT CONFIG ──
 ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
 LEVERAGE = 3                   # 3x Isolated margin
-MARGIN_PER_TRADE = 5.0         # Risk only $5 margin per trade
+MARGIN_PER_TRADE = 5.0         # Risk $5 margin per trade
 RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
+MAX_ACTIVE_PAIRS = 20          # Auto-select Top 20 liquid futures pairs
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"TELEGRAM CONFIG MISSING: TOKEN={'SET' if TELEGRAM_BOT_TOKEN else 'MISSING'}, CHAT_ID={'SET' if TELEGRAM_CHAT_ID else 'MISSING'}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -32,8 +32,28 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"Telegram dispatch error: {e}")
 
+def get_top_volume_pairs(limit: int = 20) -> list:
+    """Dynamically fetches the top USDT perpetuals by 24h volume."""
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            tickers = res.json()
+            # Filter USDT perpetual contracts, excluding stable pairs
+            usdt_tickers = [
+                t for t in tickers 
+                if t.get("symbol", "").endswith("USDT") and not any(s in t.get("symbol", "") for s in ["USDC", "FDUSD", "TUSD"])
+            ]
+            # Sort by 24h quote volume descending
+            usdt_tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+            top_symbols = [t["symbol"] for t in usdt_tickers[:limit]]
+            return top_symbols
+    except Exception as e:
+        print(f"Failed to fetch volume universe: {e}")
+    # Fallback to high-liquidity staples if API query fails
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT", "BNBUSDT", "NEARUSDT", "SUIUSDT", "AVAXUSDT", "LINKUSDT"]
+
 def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
-    """Fetches public candlestick data from Binance Futures REST API."""
     url = "https://fapi.binance.com/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -56,7 +76,6 @@ def get_klines(symbol: str, interval: str, limit: int = 60) -> list:
     return []
 
 def get_current_mark_price(symbol: str) -> float:
-    """Fetches real-time mark price for futures evaluation."""
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     params = {"symbol": symbol}
     try:
@@ -87,7 +106,6 @@ def initialize_journal():
             ])
 
 def update_active_paper_trades():
-    """Audits open trades, updates unrealized PnL, and triggers TP/SL closures."""
     if not os.path.exists(CSV_FILE):
         return
 
@@ -115,9 +133,8 @@ def update_active_paper_trades():
         if mark_price <= 0:
             continue
 
-        row["current_price"] = f"{mark_price:.2f}"
+        row["current_price"] = f"{mark_price:.4f}"
 
-        # ── LONG POSITION AUDIT ──
         if direction == "LONG":
             raw_pnl_pct = ((mark_price - entry) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
@@ -129,9 +146,9 @@ def update_active_paper_trades():
                 msg = (
                     f"🟢 <b>FUTURES TAKE PROFIT HIT: {symbol}</b>\n\n"
                     f"• <b>Direction:</b> LONG\n"
-                    f"• <b>Entry:</b> ${entry:,.2f}\n"
-                    f"• <b>Exit Price:</b> ${mark_price:,.2f}\n"
-                    f"• <b>Target:</b> ${tp:,.2f}\n\n"
+                    f"• <b>Entry:</b> ${entry:,.4f}\n"
+                    f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
+                    f"• <b>Target:</b> ${tp:,.4f}\n\n"
                     f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
@@ -142,14 +159,13 @@ def update_active_paper_trades():
                 msg = (
                     f"🛑 <b>FUTURES STOP LOSS HIT: {symbol}</b>\n\n"
                     f"• <b>Direction:</b> LONG\n"
-                    f"• <b>Entry:</b> ${entry:,.2f}\n"
-                    f"• <b>Exit Price:</b> ${mark_price:,.2f}\n"
-                    f"• <b>Stop Loss:</b> ${sl:,.2f}\n\n"
+                    f"• <b>Entry:</b> ${entry:,.4f}\n"
+                    f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
+                    f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
                     f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
 
-        # ── SHORT POSITION AUDIT ──
         elif direction == "SHORT":
             raw_pnl_pct = ((entry - mark_price) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
@@ -161,22 +177,22 @@ def update_active_paper_trades():
                 msg = (
                     f"🟢 <b>FUTURES TAKE PROFIT HIT: {symbol}</b>\n\n"
                     f"• <b>Direction:</b> SHORT\n"
-                    f"• <b>Entry:</b> ${entry:,.2f}\n"
-                    f"• <b>Exit Price:</b> ${mark_price:,.2f}\n"
-                    f"• <b>Target:</b> ${tp:,.2f}\n\n"
+                    f"• <b>Entry:</b> ${entry:,.4f}\n"
+                    f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
+                    f"• <b>Target:</b> ${tp:,.4f}\n\n"
                     f"💰 <b>Paper Return:</b> +{leveraged_pnl_pct:.2f}% (+${reward_usd:.2f})"
                 )
                 send_telegram(msg)
 
-            elif mark_price >= sl:
+            elif mark_price <= sl:
                 row["status"] = "SL HIT"
                 updated = True
                 msg = (
                     f"🛑 <b>FUTURES STOP LOSS HIT: {symbol}</b>\n\n"
                     f"• <b>Direction:</b> SHORT\n"
-                    f"• <b>Entry:</b> ${entry:,.2f}\n"
-                    f"• <b>Exit Price:</b> ${mark_price:,.2f}\n"
-                    f"• <b>Stop Loss:</b> ${sl:,.2f}\n\n"
+                    f"• <b>Entry:</b> ${entry:,.4f}\n"
+                    f"• <b>Exit Price:</b> ${mark_price:,.4f}\n"
+                    f"• <b>Stop Loss:</b> ${sl:,.4f}\n\n"
                     f"⚠️ <b>Paper Loss:</b> {leveraged_pnl_pct:.2f}% (-${risk_usd:.2f})"
                 )
                 send_telegram(msg)
@@ -197,7 +213,7 @@ def is_recent_setup_logged(symbol: str, direction: str) -> bool:
         return False
     with open(CSV_FILE, mode="r", newline="", encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
-        for row in reader[-6:]:
+        for row in reader[-10:]:
             if row.get("symbol") == symbol and row.get("direction") == direction and row.get("status") == "ACTIVE":
                 return True
     return False
@@ -207,9 +223,9 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
         writer = csv.writer(f)
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         writer.writerow([
-            now_str, symbol, direction, f"{entry:.2f}", f"{sl:.2f}",
-            f"{tp:.2f}", f"{risk_usd:.2f}", f"{reward_usd:.2f}", f"1:{RR_RATIO_TARGET}",
-            f"{entry:.2f}", "0.00%", "ACTIVE"
+            now_str, symbol, direction, f"{entry:.4f}", f"{sl:.4f}",
+            f"{tp:.4f}", f"{risk_usd:.2f}", f"{reward_usd:.2f}", f"1:{RR_RATIO_TARGET}",
+            f"{entry:.4f}", "0.00%", "ACTIVE"
         ])
 
 def analyze_market(symbol: str):
@@ -218,13 +234,11 @@ def analyze_market(symbol: str):
     if len(k_15m) < 10 or len(k_1h) < 50:
         return
 
-    # 1. 1-Hour Trend Bias
     closes_1h = [c["close"] for c in k_1h]
     ema_50_1h = calculate_ema(closes_1h, 50)
     current_price = k_15m[-1]["close"]
     trend_bias = "BULLISH" if current_price > ema_50_1h else "BEARISH"
 
-    # 2. 15-Minute FVG Imbalance
     c1, c2, c3 = k_15m[-4], k_15m[-3], k_15m[-2]
     bullish_fvg = c3["low"] > c1["high"] and c2["close"] > c2["open"]
     bearish_fvg = c3["high"] < c1["low"] and c2["close"] < c2["open"]
@@ -232,7 +246,6 @@ def analyze_market(symbol: str):
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
 
-    # 3. Long Setup Evaluation
     if trend_bias == "BULLISH" and bullish_fvg:
         entry_price = c3["low"]
         stop_loss = swing_low
@@ -252,16 +265,15 @@ def analyze_market(symbol: str):
                     f"<b>Direction:</b> 🟢 <b>LONG</b>\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
-                    f"🎯 <b>Entry:</b> ${entry_price:,.2f}\n"
-                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.2f}\n"
-                    f"🏁 <b>Take Profit:</b> ${target_price:,.2f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Trend:</b> 1H Bullish above EMA 50"
+                    f"• <b>Confluence:</b> 1H Bullish above EMA 50"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "LONG", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
 
-    # 4. Short Setup Evaluation
     elif trend_bias == "BEARISH" and bearish_fvg:
         entry_price = c3["high"]
         stop_loss = swing_high
@@ -281,11 +293,11 @@ def analyze_market(symbol: str):
                     f"<b>Direction:</b> 🔴 <b>SHORT</b>\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
-                    f"🎯 <b>Entry:</b> ${entry_price:,.2f}\n"
-                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.2f}\n"
-                    f"🏁 <b>Take Profit:</b> ${target_price:,.2f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Trend:</b> 1H Bearish below EMA 50"
+                    f"• <b>Confluence:</b> 1H Bearish below EMA 50"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "SHORT", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
@@ -295,7 +307,9 @@ if __name__ == "__main__":
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
-    print("Scanning for new 15m confluence setups...")
-    for pair in PAIRS:
+    active_pairs = get_top_volume_pairs(limit=MAX_ACTIVE_PAIRS)
+    print(f"Scanning Top {len(active_pairs)} volume perpetuals...")
+    for pair in active_pairs:
         analyze_market(pair)
+        time.sleep(0.1)  # 100ms throttle to prevent rate-limiting
     print("Execution complete.")
