@@ -242,4 +242,61 @@ def analyze_market(symbol: str):
             target_price = entry_price + (risk_per_unit * RR_RATIO_TARGET)
             risk_pct = (risk_per_unit / entry_price) * 100
 
-            if 0.5 <= risk_pct <= 2.5 and not is_recent_
+            if 0.5 <= risk_pct <= 2.5 and not is_recent_setup_logged(symbol, "LONG"):
+                notional_position = MARGIN_PER_TRADE * LEVERAGE
+                dollar_risk = (risk_pct / 100) * notional_position
+                dollar_reward = dollar_risk * RR_RATIO_TARGET
+
+                msg = (
+                    f"📊 <b>NEW PAPER TRADE LOGGED: {symbol}</b>\n\n"
+                    f"<b>Direction:</b> 🟢 <b>LONG</b>\n"
+                    f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
+                    f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
+                    f"🎯 <b>Entry:</b> ${entry_price:,.2f}\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.2f}\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.2f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
+                    f"• <b>Trend:</b> 1H Bullish above EMA 50"
+                )
+                send_telegram(msg)
+                log_signal(symbol, "LONG", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
+
+    # 4. Short Setup Evaluation
+    elif trend_bias == "BEARISH" and bearish_fvg:
+        entry_price = c3["high"]
+        stop_loss = swing_high
+        risk_per_unit = stop_loss - entry_price
+
+        if risk_per_unit > 0:
+            target_price = entry_price - (risk_per_unit * RR_RATIO_TARGET)
+            risk_pct = (risk_per_unit / entry_price) * 100
+
+            if 0.5 <= risk_pct <= 2.5 and not is_recent_setup_logged(symbol, "SHORT"):
+                notional_position = MARGIN_PER_TRADE * LEVERAGE
+                dollar_risk = (risk_pct / 100) * notional_position
+                dollar_reward = dollar_risk * RR_RATIO_TARGET
+
+                msg = (
+                    f"📊 <b>NEW PAPER TRADE LOGGED: {symbol}</b>\n\n"
+                    f"<b>Direction:</b> 🔴 <b>SHORT</b>\n"
+                    f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
+                    f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
+                    f"🎯 <b>Entry:</b> ${entry_price:,.2f}\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.2f}\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.2f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
+                    f"• <b>Trend:</b> 1H Bearish below EMA 50"
+                )
+                send_telegram(msg)
+                log_signal(symbol, "SHORT", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
+
+if __name__ == "__main__":
+    initialize_journal()
+    send_telegram("🚀 <b>Futures Confluence Engine connected successfully!</b>\nMonitoring SOL and ETH 15m/1h setups...")
+    print("Auditing active paper trades...")
+    update_active_paper_trades()
+
+    print("Scanning for new 15m confluence setups...")
+    for pair in PAIRS:
+        analyze_market(pair)
+    print("Execution complete.")
