@@ -13,7 +13,7 @@ PAIRS = ["SOLUSDT", "ETHUSDT", "BTCUSDT", "DOGEUSDT", "XRPUSDT", "SUIUSDT", "NEA
 ACCOUNT_BALANCE_USD = 15.0     # Reference bankroll
 LEVERAGE = 3                   # 3x Isolated margin
 MARGIN_PER_TRADE = 5.0         # Risk $5 margin per trade
-RR_RATIO_TARGET = 2.5          # Minimum 1:2.5 Risk-to-Reward
+RR_RATIO_TARGET = 3.0          # Upgraded 1:3.0 Risk-to-Reward for higher ROI
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -21,7 +21,7 @@ HEADERS = {
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram secret missing: Make sure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in GitHub Secrets.")
+        print("⚠️ Telegram secret missing: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -86,6 +86,26 @@ def calculate_ema(prices: list, period: int) -> float:
         ema = (p - ema) * multiplier + ema
     return ema
 
+def calculate_atr(candles: list, period: int = 14) -> float:
+    """Calculates 14-period Average True Range for dynamic volatility stops."""
+    if len(candles) < period + 1:
+        return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        h, l, prev_c = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        tr_list.append(tr)
+    return sum(tr_list[-period:]) / period
+
+def is_displacement_confirmed(candles: list, c_index: int) -> bool:
+    """Validates that the impulse candle carries >= 1.3x 15-period average volume."""
+    vol_recent = [c["volume"] for c in candles[-16:-1]]
+    if not vol_recent:
+        return True
+    avg_vol = sum(vol_recent) / len(vol_recent)
+    candle_vol = candles[c_index]["volume"]
+    return candle_vol >= (avg_vol * 1.3)
+
 def initialize_journal():
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, mode="w", newline="", encoding="utf-8") as f:
@@ -97,10 +117,7 @@ def initialize_journal():
             ])
 
 def update_active_paper_trades():
-    """
-    Audits active paper trades.
-    Strictly verifies TP and SL boundaries against price and direction.
-    """
+    """Audits open trades with dual mathematical sanity checks."""
     if not os.path.exists(CSV_FILE):
         return
 
@@ -136,7 +153,7 @@ def update_active_paper_trades():
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            # TP: Price reaches or exceeds TP AND PnL is strictly positive
+            # TP: Price reaches target AND return is positive
             if mark_price >= tp and leveraged_pnl_pct > 0:
                 row["status"] = "TP HIT"
                 updated = True
@@ -150,7 +167,7 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-            # SL: Price drops to or below SL AND PnL is strictly negative
+            # SL: Price hits stop-loss AND return is negative
             elif mark_price <= sl and leveraged_pnl_pct < 0:
                 row["status"] = "SL HIT"
                 updated = True
@@ -164,13 +181,13 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-        # ── SHORT AUDIT (FIXED OPERATORS) ──
+        # ── SHORT AUDIT (CORRECTED OPERATORS) ──
         elif direction == "SHORT":
             raw_pnl_pct = ((entry - mark_price) / entry) * 100
             leveraged_pnl_pct = raw_pnl_pct * LEVERAGE
             row["pnl_pct"] = f"{leveraged_pnl_pct:+.2f}%"
 
-            # TP: Price drops down to or below TP AND PnL is strictly positive
+            # TP: Price drops down to target AND return is positive
             if mark_price <= tp and leveraged_pnl_pct > 0:
                 row["status"] = "TP HIT"
                 updated = True
@@ -184,7 +201,7 @@ def update_active_paper_trades():
                 )
                 send_telegram(msg)
 
-            # SL: Price rises up to or above SL AND PnL is strictly negative
+            # SL: Price rises up to stop-loss AND return is negative
             elif mark_price >= sl and leveraged_pnl_pct < 0:
                 row["status"] = "SL HIT"
                 updated = True
@@ -229,31 +246,43 @@ def log_signal(symbol, direction, entry, sl, tp, risk_usd, reward_usd):
             f"{entry:.4f}", "0.00%", "ACTIVE"
         ])
 
-def check_fvg_window(candles: list) -> tuple[bool, bool, float]:
+def check_institutional_fvg(candles: list) -> tuple[bool, bool, float, str]:
     """
-    Audits the last 3 closed candle sets for a 15-minute Fair Value Gap.
-    Returns (bullish_fvg, bearish_fvg, entry_target).
+    Audits 15M candles for an Institutional FVG with Displacement & Liquidity Sweeps.
+    Returns (bullish_fvg, bearish_fvg, entry_target, note).
     """
     for offset in [-4, -3]:
         c1 = candles[offset - 1]
         c2 = candles[offset]
         c3 = candles[offset + 1]
 
-        # Bullish FVG: Low of candle 3 is above High of candle 1
+        # 1. Displacement Volume Filter
+        if not is_displacement_confirmed(candles, offset):
+            continue
+
+        # 2. Bullish FVG Setup
         if c3["low"] > c1["high"] and c2["close"] > c2["open"]:
-            return True, False, c3["low"]
+            # Verify Liquidity Sweep: Did C1 or C2 sweep prior swing low?
+            prior_lows = [c["low"] for c in candles[offset - 8:offset - 1]]
+            sweep_confirmed = prior_lows and min(c1["low"], c2["low"]) <= min(prior_lows)
+            note = "Displacement + Liquidity Sweep Confirmed" if sweep_confirmed else "Displacement Volume Confirmed"
+            return True, False, c3["low"], note
 
-        # Bearish FVG: High of candle 3 is below Low of candle 1
+        # 3. Bearish FVG Setup
         if c3["high"] < c1["low"] and c2["close"] < c2["open"]:
-            return False, True, c3["high"]
+            # Verify Liquidity Sweep: Did C1 or C2 sweep prior swing high?
+            prior_highs = [c["high"] for c in candles[offset - 8:offset - 1]]
+            sweep_confirmed = prior_highs and max(c1["high"], c2["high"]) >= max(prior_highs)
+            note = "Displacement + Liquidity Sweep Confirmed" if sweep_confirmed else "Displacement Volume Confirmed"
+            return False, True, c3["high"], note
 
-    return False, False, 0.0
+    return False, False, 0.0, "NONE"
 
 def analyze_market(symbol: str):
     k_15m = get_klines_mexc(symbol, "15m", limit=50)
     k_1h = get_klines_mexc(symbol, "1h", limit=60)
-    if len(k_15m) < 10 or len(k_1h) < 50:
-        print(f"[{symbol}] Insufficient candle data.")
+    if len(k_15m) < 15 or len(k_1h) < 50:
+        print(f"[{symbol}] Insufficient candle history.")
         return
 
     closes_1h = [c["close"] for c in k_1h]
@@ -261,66 +290,70 @@ def analyze_market(symbol: str):
     current_price = k_15m[-1]["close"]
     trend_bias = "BULLISH" if current_price > ema_50_1h else "BEARISH"
 
-    bullish_fvg, bearish_fvg, fvg_entry = check_fvg_window(k_15m)
+    bullish_fvg, bearish_fvg, fvg_entry, edge_note = check_institutional_fvg(k_15m)
+
+    # Calculate dynamic volatility buffer using ATR
+    atr_15m = calculate_atr(k_15m, period=14)
+    atr_buffer = atr_15m * 0.40  # 40% ATR buffer stops premature wick-outs
 
     swing_low = min(c["low"] for c in k_15m[-10:])
     swing_high = max(c["high"] for c in k_15m[-10:])
 
     status_fvg = "BULL" if bullish_fvg else "BEAR" if bearish_fvg else "NONE"
-    print(f"[{symbol}] Price: ${current_price:,.4f} | 1H EMA: ${ema_50_1h:,.4f} ({trend_bias}) | FVG: {status_fvg}")
+    print(f"[{symbol}] Price: ${current_price:,.4f} | 1H EMA: ${ema_50_1h:,.4f} ({trend_bias}) | FVG: {status_fvg} | ATR: ${atr_15m:.4f}")
 
     if trend_bias == "BULLISH" and bullish_fvg:
         entry_price = fvg_entry if fvg_entry > 0 else current_price
-        stop_loss = swing_low
+        stop_loss = swing_low - atr_buffer
         risk_per_unit = entry_price - stop_loss
 
         if risk_per_unit > 0:
             target_price = entry_price + (risk_per_unit * RR_RATIO_TARGET)
             risk_pct = (risk_per_unit / entry_price) * 100
 
-            if 0.4 <= risk_pct <= 3.5 and not is_recent_setup_logged(symbol, "LONG"):
+            if 0.3 <= risk_pct <= 3.8 and not is_recent_setup_logged(symbol, "LONG"):
                 notional_position = MARGIN_PER_TRADE * LEVERAGE
                 dollar_risk = (risk_pct / 100) * notional_position
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
 
                 msg = (
-                    f"📊 <b>NEW PAPER TRADE LOGGED: {symbol}</b>\n\n"
+                    f"📊 <b>NEW HIGH-CONFLUENCE TRADE: {symbol}</b>\n\n"
                     f"<b>Direction:</b> 🟢 <b>LONG</b>\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
                     f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
-                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
-                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f} (Buffered ATR)\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R Target)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Confluence:</b> 1H Bullish above EMA 50"
+                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA Bias"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "LONG", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
 
     elif trend_bias == "BEARISH" and bearish_fvg:
         entry_price = fvg_entry if fvg_entry > 0 else current_price
-        stop_loss = swing_high
+        stop_loss = swing_high + atr_buffer
         risk_per_unit = stop_loss - entry_price
 
         if risk_per_unit > 0:
             target_price = entry_price - (risk_per_unit * RR_RATIO_TARGET)
             risk_pct = (risk_per_unit / entry_price) * 100
 
-            if 0.4 <= risk_pct <= 3.5 and not is_recent_setup_logged(symbol, "SHORT"):
+            if 0.3 <= risk_pct <= 3.8 and not is_recent_setup_logged(symbol, "SHORT"):
                 notional_position = MARGIN_PER_TRADE * LEVERAGE
                 dollar_risk = (risk_pct / 100) * notional_position
                 dollar_reward = dollar_risk * RR_RATIO_TARGET
 
                 msg = (
-                    f"📊 <b>NEW PAPER TRADE LOGGED: {symbol}</b>\n\n"
+                    f"📊 <b>NEW HIGH-CONFLUENCE TRADE: {symbol}</b>\n\n"
                     f"<b>Direction:</b> 🔴 <b>SHORT</b>\n"
                     f"• <b>Leverage:</b> {LEVERAGE}x (Isolated)\n"
                     f"• <b>Margin:</b> ${MARGIN_PER_TRADE:.2f} (Notional: ${notional_position:.2f})\n\n"
                     f"🎯 <b>Entry:</b> ${entry_price:,.4f}\n"
-                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f}\n"
-                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R)\n\n"
+                    f"🛑 <b>Stop Loss:</b> ${stop_loss:,.4f} (Buffered ATR)\n"
+                    f"🏁 <b>Take Profit:</b> ${target_price:,.4f} (1:{RR_RATIO_TARGET} R:R Target)\n\n"
                     f"• <b>Risk:</b> -${dollar_risk:.2f} | <b>Reward:</b> +${dollar_reward:.2f}\n"
-                    f"• <b>Confluence:</b> 1H Bearish below EMA 50"
+                    f"• <b>Setup Edge:</b> {edge_note} + 1H EMA Bias"
                 )
                 send_telegram(msg)
                 log_signal(symbol, "SHORT", entry_price, stop_loss, target_price, dollar_risk, dollar_reward)
@@ -330,7 +363,7 @@ if __name__ == "__main__":
     print("Auditing active paper trades...")
     update_active_paper_trades()
 
-    print("Scanning target perpetuals...")
+    print("Scanning target perpetuals with Institutional Edge Engine...")
     for pair in PAIRS:
         analyze_market(pair)
         time.sleep(0.1)
